@@ -19,6 +19,8 @@ import { cn } from "@/lib/utils"
 import Link from "next/link"
 import ReactMarkdown from "react-markdown"
 
+import { usePdfProcessor } from "@/hooks/use-pdf-processor"
+
 interface Message {
   id: string
   role: "user" | "assistant"
@@ -95,6 +97,10 @@ export default function ChatPage() {
   const imageInputRef = useRef<HTMLInputElement>(null)
   const recognitionRef = useRef<SpeechRecognition | null>(null)
   const attachMenuRef = useRef<HTMLDivElement>(null)
+  
+  // Hook for server-side document processing
+  const { processDocument, isProcessing: isPdfProcessing, progress: pdfProgress } = usePdfProcessor()
+
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -119,54 +125,113 @@ export default function ChatPage() {
     return () => document.removeEventListener("mousedown", handleClickOutside)
   }, [])
 
+  // Track accumulated finalized speech text between start/stop cycles
+  const finalTranscriptRef = useRef("")
+  const voiceRetryCountRef = useRef(0)
+  const MAX_VOICE_RETRIES = 3
+
   // Initialize speech recognition
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      const SpeechRecognitionAPI = (window as Window & { 
-        SpeechRecognition?: new () => SpeechRecognition
-        webkitSpeechRecognition?: new () => SpeechRecognition 
-      }).SpeechRecognition || (window as Window & { 
-        SpeechRecognition?: new () => SpeechRecognition
-        webkitSpeechRecognition?: new () => SpeechRecognition 
-      }).webkitSpeechRecognition
-      
-      if (SpeechRecognitionAPI) {
-        const recognition = new SpeechRecognitionAPI()
-        recognition.continuous = true
-        recognition.interimResults = true
-        recognition.lang = "en-IN"
+    if (typeof window === "undefined") return
 
-        recognition.onresult = (event: SpeechRecognitionEvent) => {
-          let transcript = ""
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript
+    const SpeechRecognitionAPI = (window as Window & {
+      SpeechRecognition?: new () => SpeechRecognition
+      webkitSpeechRecognition?: new () => SpeechRecognition
+    }).SpeechRecognition || (window as Window & {
+      SpeechRecognition?: new () => SpeechRecognition
+      webkitSpeechRecognition?: new () => SpeechRecognition
+    }).webkitSpeechRecognition
+
+    if (!SpeechRecognitionAPI) return
+
+    const recognition = new SpeechRecognitionAPI()
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.lang = "en-IN"
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      // Build transcript: finalized segments are committed, interim is preview-only
+      let finalizedChunk = ""
+      let interimChunk = ""
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i]
+        if (result.isFinal) {
+          finalizedChunk += result[0].transcript
+        } else {
+          interimChunk += result[0].transcript
+        }
+      }
+
+      if (finalizedChunk) {
+        finalTranscriptRef.current += finalizedChunk
+      }
+
+      // Show finalized + current interim preview (interim will be replaced on next event)
+      setInput(finalTranscriptRef.current + interimChunk)
+    }
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      console.warn("Speech recognition error:", event.error)
+
+      // Don't retry on permission errors
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setError("Microphone access denied. Please allow microphone permissions.")
+        setIsListening(false)
+        return
+      }
+
+      // Retry on transient errors (network, audio-capture, aborted, no-speech)
+      if (voiceRetryCountRef.current < MAX_VOICE_RETRIES) {
+        voiceRetryCountRef.current++
+        console.log(`Retrying speech recognition (${voiceRetryCountRef.current}/${MAX_VOICE_RETRIES})...`)
+        setTimeout(() => {
+          try {
+            recognition.start()
+          } catch {
+            setIsListening(false)
           }
-          setInput(prev => prev + transcript)
-        }
-
-        recognition.onerror = () => {
-          setIsListening(false)
-        }
-
-        recognition.onend = () => {
-          setIsListening(false)
-        }
-
-        recognitionRef.current = recognition
+        }, 500)
+      } else {
+        setIsListening(false)
+        setError("Voice input failed after multiple attempts. Please try again.")
       }
     }
+
+    recognition.onend = () => {
+      // Only mark as stopped if we're not in a retry cycle
+      // If we ARE retrying, the onerror handler restarts it
+      setIsListening(false)
+    }
+
+    recognitionRef.current = recognition
   }, [])
 
   const startListening = () => {
     if (recognitionRef.current && !isListening) {
+      // Reset state for a fresh listening session
+      finalTranscriptRef.current = input // preserve any existing typed text
+      voiceRetryCountRef.current = 0
+      setError(null)
       setIsListening(true)
-      recognitionRef.current.start()
+      try {
+        recognitionRef.current.start()
+      } catch (e) {
+        console.warn("Failed to start speech recognition:", e)
+        setIsListening(false)
+        setError("Could not start voice input. Please try again.")
+      }
     }
   }
 
   const stopListening = () => {
     if (recognitionRef.current && isListening) {
-      recognitionRef.current.stop()
+      voiceRetryCountRef.current = MAX_VOICE_RETRIES // prevent retry on intentional stop
+      try {
+        recognitionRef.current.stop()
+      } catch {
+        // Already stopped
+      }
       setIsListening(false)
     }
   }
@@ -238,23 +303,12 @@ export default function ChatPage() {
     setUploadedDocs(prev => prev.filter(doc => doc.id !== id))
   }
 
-  // Analyze document using the analyze-document API endpoint
-  const analyzeDocument = async (file: File): Promise<string> => {
-    const formData = new FormData()
-    formData.append("file", file)
-
-    const response = await fetch("/api/analyze-document", {
-      method: "POST",
-      body: formData,
-    })
-
-    if (!response.ok) {
-      const errorData = await response.json()
-      throw new Error(errorData.error || "Failed to analyze document")
-    }
-
-    const data = await response.json()
-    return data.analysis
+  /**
+   * Send any file to the server for processing + AI analysis.
+   * Returns { text, isAnalyzed: true } — the server handles everything.
+   */
+  const analyzeDocument = async (file: File): Promise<{ text: string; isAnalyzed: boolean }> => {
+    return processDocument(file)
   }
 
   const handleSend = async () => {
@@ -275,20 +329,27 @@ export default function ChatPage() {
     setUploadedDocs([])
 
     let messageContent = userQuery
-    let analyzedContent = ""
+    let rawDocumentText = ""      // Raw extracted text → send to /api/chat for AI analysis
+    let preAnalyzedContent = ""   // Already-analyzed by server → show directly as assistant message
 
     // Process uploaded documents if any
     if (docsToProcess.length > 0) {
       try {
         for (const doc of docsToProcess) {
-          // For PDFs, images, and DOCX - use the analyze-document endpoint
           if (doc.file && (doc.isPdf || doc.isImage || doc.type.includes("wordprocessingml"))) {
             console.log("Analyzing document:", doc.name)
-            const analysis = await analyzeDocument(doc.file)
-            analyzedContent += `\n\n--- Document: ${doc.name} ---\n${analysis}`
+            const result = await analyzeDocument(doc.file)
+
+            if (result.isAnalyzed) {
+              // Server already produced a full AI analysis — collect it
+              preAnalyzedContent += `\n\n--- Analysis of: ${doc.name} ---\n${result.text}`
+            } else {
+              // Raw text — needs AI analysis via /api/chat
+              rawDocumentText += `\n\n--- Document: ${doc.name} ---\n${result.text}`
+            }
           } else if (doc.content && !doc.isImage && !doc.isPdf) {
-            // For plain text files, use the content directly
-            analyzedContent += `\n\n--- Document: ${doc.name} ---\n${doc.content.substring(0, 5000)}`
+            // Plain text files — raw content to be analyzed
+            rawDocumentText += `\n\n--- Document: ${doc.name} ---\n${doc.content.substring(0, 5000)}`
           }
         }
       } catch (err) {
@@ -299,11 +360,37 @@ export default function ChatPage() {
       }
     }
 
-    // Build the full message content with analyzed documents
-    if (analyzedContent) {
+    // If server already analyzed everything and user typed no question,
+    // show the analysis directly without another round-trip to /api/chat
+    const hasRawDocs = rawDocumentText.length > 0
+    const hasPreAnalyzed = preAnalyzedContent.length > 0
+
+    if (hasPreAnalyzed && !hasRawDocs && !userQuery) {
+      // Show server's analysis directly as assistant message — no need to re-process
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        role: "user",
+        content: "Analyze uploaded document(s)",
+        timestamp: new Date(),
+        documents: docsToProcess.map(doc => doc.name)
+      }
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: preAnalyzedContent.trim(),
+        timestamp: new Date(),
+      }
+      setMessages(prev => [...prev, userMessage, assistantMessage])
+      setIsLoading(false)
+      return
+    }
+
+    // Build the message content for /api/chat
+    if (hasRawDocs || hasPreAnalyzed) {
+      const allDocContent = rawDocumentText + preAnalyzedContent
       messageContent = userQuery 
-        ? `${userQuery}\n\nPlease analyze the following document(s) in context of my question:${analyzedContent}`
-        : `Please analyze the following document(s) and provide a detailed summary with key legal points:${analyzedContent}`
+        ? `${userQuery}\n\nPlease analyze the following document(s) in context of my question:${allDocContent}`
+        : `Please analyze the following document(s) and provide a detailed legal analysis with: Simple Summary, Purpose, Key Clauses, Risks/Red Flags, Relevant Indian Laws, and Next Steps:${allDocContent}`
     }
 
     const userMessage: Message = {
@@ -517,14 +604,18 @@ export default function ChatPage() {
               ))}
               
               {/* Loading indicator */}
-              {isLoading && (
+              {(isLoading || isPdfProcessing) && (
                 <div className="flex gap-4 justify-start">
                   <div className="w-8 h-8 rounded-full bg-[#19c37d] flex items-center justify-center shrink-0">
                     <Bot className="h-5 w-5 text-white" />
                   </div>
                   <div className="flex items-center gap-2 text-gray-400">
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    <span>Thinking...</span>
+                    <span>{
+                        isPdfProcessing 
+                        ? `Processing PDF pages... ${pdfProgress}%` 
+                        : "Thinking..."
+                    }</span>
                   </div>
                 </div>
               )}

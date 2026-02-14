@@ -3,19 +3,34 @@ import mammoth from "mammoth"
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 
-// Dynamic import for pdf-parse to handle CommonJS module
-async function parsePDF(buffer: Buffer): Promise<string> {
+// ---------------------------------------------------------------------------
+// PDF text extraction — server-side only, no canvas needed
+// ---------------------------------------------------------------------------
+
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  // Try pdf-parse first (battle-tested CJS library)
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const pdfParseModule = require("pdf-parse")
     const pdfParse = pdfParseModule.default || pdfParseModule
     const data = await pdfParse(buffer)
     return data.text || ""
-  } catch (error) {
-    console.error("PDF parse error:", error)
+  } catch (err) {
+    console.warn("pdf-parse failed, trying unpdf:", err)
+  }
+
+  // Fallback: unpdf
+  try {
+    const { extractText } = await import("unpdf")
+    const { text } = await extractText(new Uint8Array(buffer), { mergePages: true })
+    return text ?? ""
+  } catch (err) {
+    console.error("unpdf extractText also failed:", err)
     return ""
   }
 }
+
+// ---------------------------------------------------------------------------
 
 export async function POST(request: NextRequest) {
   try {
@@ -36,54 +51,48 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Extract text from file based on type
+    // Determine how to handle the file
     let documentText = ""
     let useVisionAPI = false
+    let usePdfFileInput = false
     let fileBase64 = ""
     let mimeType = ""
 
-    if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || 
-        file.name.endsWith(".docx")) {
-      // Handle .docx files
+    if (
+      file.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      file.name.endsWith(".docx")
+    ) {
       const arrayBuffer = await file.arrayBuffer()
       const result = await mammoth.extractRawText({ arrayBuffer })
       documentText = result.value
     } else if (file.type === "text/plain" || file.name.endsWith(".txt")) {
-      // Handle .txt files
       documentText = await file.text()
     } else if (file.type === "application/pdf" || file.name.endsWith(".pdf")) {
-      // Handle PDF files - extract text using pdf-parse
-      try {
-        const arrayBuffer = await file.arrayBuffer()
-        const buffer = Buffer.from(arrayBuffer)
-        documentText = await parsePDF(buffer)
-        
-        // If no text extracted, try using vision API as fallback for scanned PDFs
-        if (!documentText || documentText.trim().length < 10) {
-          // Convert PDF to image-like handling for scanned documents
-          const fileBase64Temp = buffer.toString("base64")
-          // For scanned PDFs, we'll inform the user
-          return NextResponse.json(
-            { error: "This appears to be a scanned PDF with no extractable text. Please upload the document as an image (PNG/JPG) for OCR processing, or upload a text-based PDF." },
-            { status: 400 }
-          )
-        }
-      } catch (error) {
-        console.error("PDF parsing error:", error)
-        return NextResponse.json(
-          { error: "Failed to parse PDF. Please try uploading as an image instead." },
-          { status: 400 }
-        )
-      }
-    } else if (file.type.startsWith("image/")) {
-      // Handle image files with OCR via GPT-4o vision
+      // Extract text from PDF server-side
       const arrayBuffer = await file.arrayBuffer()
       const buffer = Buffer.from(arrayBuffer)
-      fileBase64 = buffer.toString("base64")
+
+      try {
+        documentText = await extractPdfText(buffer)
+      } catch (error) {
+        console.error("PDF text extraction error:", error)
+      }
+
+      // If no meaningful text → scanned PDF → send raw PDF to GPT-4o
+      // GPT-4o supports native PDF file input via the "file" content type
+      if (!documentText || documentText.trim().length < 10) {
+        console.log("PDF has little/no extractable text — sending raw PDF to GPT-4o")
+        fileBase64 = buffer.toString("base64")
+        usePdfFileInput = true
+        documentText = ""
+      }
+    } else if (file.type.startsWith("image/")) {
+      const arrayBuffer = await file.arrayBuffer()
+      fileBase64 = Buffer.from(arrayBuffer).toString("base64")
       mimeType = file.type
       useVisionAPI = true
     } else {
-      // Try to read as text for other file types
       try {
         documentText = await file.text()
       } catch {
@@ -94,7 +103,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    if (!useVisionAPI && (!documentText || documentText.trim().length === 0)) {
+    if (!useVisionAPI && !usePdfFileInput && (!documentText || documentText.trim().length === 0)) {
       return NextResponse.json(
         { error: "Could not extract text from the document. The file may be empty or corrupted." },
         { status: 400 }
@@ -194,21 +203,39 @@ CRITICAL RULES:
 
 Remember: Your goal is to make legal documents understandable for everyone, not to replace professional legal counsel.`
 
-    type MessageContent = string | Array<{ type: string; text?: string; image_url?: { url: string } }>
-    
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    type ContentPart = any
+    type MessageContent = string | ContentPart[]
     let messages: Array<{ role: string; content: MessageContent }>
 
-    if (useVisionAPI) {
-      // Use GPT-4o vision for images (OCR)
+    const userPrompt = "Please analyze this legal document. First, carefully extract and read all text from the document (including any scanned or image-based content using OCR). Then provide the structured analysis as specified."
+
+    if (usePdfFileInput) {
+      // Scanned / image-based PDF → send raw PDF to GPT-4o using native file input
       messages = [
         { role: "system", content: systemMessage },
         {
           role: "user",
           content: [
+            { type: "text", text: userPrompt },
             {
-              type: "text",
-              text: "Please analyze this legal document. First, carefully extract and read all text from the document (including any scanned or image-based content using OCR). Then provide the structured analysis as specified.",
+              type: "file",
+              file: {
+                filename: file.name || "document.pdf",
+                file_data: `data:application/pdf;base64,${fileBase64}`,
+              },
             },
+          ],
+        },
+      ]
+    } else if (useVisionAPI) {
+      // Image files → GPT-4o vision
+      messages = [
+        { role: "system", content: systemMessage },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userPrompt },
             {
               type: "image_url",
               image_url: {
